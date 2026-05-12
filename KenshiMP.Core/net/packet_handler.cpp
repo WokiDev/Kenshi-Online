@@ -33,8 +33,23 @@ public:
     static void Initialize() {
         Core::Get().GetClient().SetPacketCallback(
             [](const uint8_t* data, size_t size, int channel) {
-                HandlePacket(data, size, channel);
+                // SEH-guard the whole dispatch. The game runs Update() on its
+                // main thread; if a malformed packet ever triggers a fault
+                // inside a deserializer we still want the game to keep
+                // running (the player can disconnect and reconnect). MSVC
+                // forbids __try in a function with C++ unwind, so the
+                // dispatch lives in its own thunk. (#69)
+                SafeHandlePacket(data, size, channel);
             });
+    }
+
+    static void SafeHandlePacket(const uint8_t* data, size_t size, int channel) {
+        __try {
+            HandlePacket(data, size, channel);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            spdlog::error("PacketHandler: SEH caught exception during dispatch "
+                          "(channel={} size={})", channel, size);
+        }
     }
 
     static void HandlePacket(const uint8_t* data, size_t size, int channel) {
@@ -625,6 +640,21 @@ private:
             if (std::isnan(pos.posX) || std::isnan(pos.posY) || std::isnan(pos.posZ) ||
                 std::isinf(pos.posX) || std::isinf(pos.posY) || std::isinf(pos.posZ)) {
                 spdlog::warn("PacketHandler: Skipping entity {} — position contains NaN/Inf", pos.entityId);
+                continue;
+            }
+
+            // Reject world-positions outside Kenshi's actual map bounds. The
+            // playable area is roughly ±400 km; anything past 1 million units
+            // is either a buggy server, a modified client, or junk data —
+            // accepting it would teleport the remote character into the void
+            // and corrupt the snap-correction state for several frames.
+            constexpr float MAX_WORLD_COORD = 1.0e6f;
+            if (std::abs(pos.posX) > MAX_WORLD_COORD ||
+                std::abs(pos.posY) > MAX_WORLD_COORD ||
+                std::abs(pos.posZ) > MAX_WORLD_COORD) {
+                spdlog::warn("PacketHandler: Skipping entity {} — position outside world bounds "
+                             "({:.0f},{:.0f},{:.0f})",
+                             pos.entityId, pos.posX, pos.posY, pos.posZ);
                 continue;
             }
 

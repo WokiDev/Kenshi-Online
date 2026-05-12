@@ -881,6 +881,43 @@ void GameServer::HandleChatMessage(ConnectedPlayer& player, PacketReader& reader
     if (!reader.ReadString(message)) return;
     if (message.empty()) return;
 
+    // Cap chat length to prevent abuse / oversized reliable packets. ReadString
+    // already enforces an upper bound from the wire format, but enforce a sane
+    // gameplay limit (longer messages won't render in the HUD either way).
+    constexpr size_t MAX_CHAT_LEN = 256;
+    if (message.size() > MAX_CHAT_LEN) {
+        message.resize(MAX_CHAT_LEN);
+    }
+
+    // Strip control characters that could break the client's text renderer or
+    // be used to forge fake system messages.
+    for (char& c : message) {
+        if (c == '\r' || c == '\n' || c == '\t') c = ' ';
+        else if (static_cast<unsigned char>(c) < 0x20) c = '?';
+    }
+
+    // Rate-limit: at most 4 chat messages per second per player. Without this,
+    // a malicious or buggy client can flood the channel and starve other
+    // reliable traffic.
+    const double now = m_uptime;
+    auto& bucket = player.chatBucket;
+    if (bucket.lastRefill <= 0.0) {
+        bucket.lastRefill = now;
+        bucket.tokens = CHAT_BUCKET_CAP;
+    }
+    double dt = now - bucket.lastRefill;
+    bucket.tokens = std::min(double(CHAT_BUCKET_CAP), bucket.tokens + dt * CHAT_REFILL_PER_SEC);
+    bucket.lastRefill = now;
+    if (bucket.tokens < 1.0) {
+        static thread_local int s_logCount = 0;
+        if (++s_logCount <= 10) {
+            spdlog::warn("GameServer: Throttled chat from '{}' (id={}) — exceeded rate limit",
+                         player.name, player.id);
+        }
+        return;
+    }
+    bucket.tokens -= 1.0;
+
     spdlog::info("[Chat] {}: {}", player.name, message);
 
     // Broadcast to all OTHER players (don't echo back to sender)
@@ -916,6 +953,28 @@ void GameServer::HandleBuildRequest(ConnectedPlayer& player, PacketReader& reade
         spdlog::warn("GameServer: Rejected build from '{}' too far from player ({:.0f}m away)",
                      player.name, std::sqrt(distSq));
         return;
+    }
+
+    // Per-player build rate limit (token bucket — refills at BUILD_REFILL_PER_SEC).
+    {
+        const double now = m_uptime;
+        auto& bucket = player.buildBucket;
+        if (bucket.lastRefill <= 0.0) {
+            bucket.lastRefill = now;
+            bucket.tokens = BUILD_BUCKET_CAP;
+        }
+        double dt = now - bucket.lastRefill;
+        bucket.tokens = std::min(BUILD_BUCKET_CAP, bucket.tokens + dt * BUILD_REFILL_PER_SEC);
+        bucket.lastRefill = now;
+        if (bucket.tokens < 1.0) {
+            static thread_local int s_logCount = 0;
+            if (++s_logCount <= 10) {
+                spdlog::warn("GameServer: Throttled build from '{}' (id={}) — exceeded rate limit",
+                             player.name, player.id);
+            }
+            return;
+        }
+        bucket.tokens -= 1.0;
     }
 
     // Create building entity
@@ -991,7 +1050,15 @@ void GameServer::BroadcastPositions() {
             spdlog::error("Failed to create packet ({} bytes)", writer.Size());
             continue;
         }
-        enet_peer_send(player.peer, KMP_CHANNEL_UNRELIABLE_SEQ, pkt);
+        if (!player.peer || player.peer->state != ENET_PEER_STATE_CONNECTED) {
+            // Peer left between iteration and send; drop the packet to avoid
+            // an ENet-internal leak from enet_peer_send failure.
+            enet_packet_destroy(pkt);
+            continue;
+        }
+        if (enet_peer_send(player.peer, KMP_CHANNEL_UNRELIABLE_SEQ, pkt) < 0) {
+            enet_packet_destroy(pkt);
+        }
     }
 }
 
@@ -1344,11 +1411,14 @@ void GameServer::SendWorldSnapshot(ConnectedPlayer& player) {
 // ── Broadcasting ──
 
 void GameServer::Broadcast(const uint8_t* data, size_t len, int channel, uint32_t flags) {
+    if (!m_host) return;
     ENetPacket* pkt = enet_packet_create(data, len, flags);
     if (!pkt) {
         spdlog::error("Failed to create packet ({} bytes)", len);
         return;
     }
+    // enet_host_broadcast takes ownership of the packet — no per-send return
+    // value to check. ENet itself handles peer-not-connected cases.
     enet_host_broadcast(m_host, channel, pkt);
 }
 
@@ -1358,12 +1428,25 @@ void GameServer::BroadcastExcept(PlayerID exclude, const uint8_t* data, size_t l
     for (auto& [id, player] : m_players) {
         if (id == exclude) continue;
         if (!player.peer) continue;
+        if (player.peer->state != ENET_PEER_STATE_CONNECTED) continue;
         ENetPacket* pkt = enet_packet_create(data, len, flags);
         if (!pkt) {
             spdlog::error("Failed to create packet ({} bytes)", len);
             continue;
         }
-        enet_peer_send(player.peer, channel, pkt);
+        // enet_peer_send returns -1 on failure WITHOUT taking ownership of the
+        // packet — so we have to destroy it ourselves to avoid a leak. Failures
+        // are typical for peers in transient disconnect states; only log first
+        // few to avoid log spam during mass disconnects.
+        if (enet_peer_send(player.peer, channel, pkt) < 0) {
+            enet_packet_destroy(pkt);
+            static thread_local int s_failCount = 0;
+            if (++s_failCount <= 5) {
+                spdlog::debug("GameServer: BroadcastExcept send failed to peer {} (state={})",
+                              id, static_cast<int>(player.peer->state));
+            }
+            continue;
+        }
         sent++;
     }
     spdlog::debug("GameServer: BroadcastExcept(exclude={}) sent to {} peers ({} bytes, ch={})",
@@ -1372,13 +1455,18 @@ void GameServer::BroadcastExcept(PlayerID exclude, const uint8_t* data, size_t l
 
 void GameServer::SendTo(PlayerID id, const uint8_t* data, size_t len, int channel, uint32_t flags) {
     auto it = m_players.find(id);
-    if (it != m_players.end()) {
-        ENetPacket* pkt = enet_packet_create(data, len, flags);
-        if (!pkt) {
-            spdlog::error("Failed to create packet ({} bytes)", len);
-            return;
-        }
-        enet_peer_send(it->second.peer, channel, pkt);
+    if (it == m_players.end()) return;
+    if (!it->second.peer) return;
+    if (it->second.peer->state != ENET_PEER_STATE_CONNECTED) return;
+
+    ENetPacket* pkt = enet_packet_create(data, len, flags);
+    if (!pkt) {
+        spdlog::error("Failed to create packet ({} bytes)", len);
+        return;
+    }
+    if (enet_peer_send(it->second.peer, channel, pkt) < 0) {
+        // Failed to enqueue — destroy the orphaned packet to avoid a leak.
+        enet_packet_destroy(pkt);
     }
 }
 

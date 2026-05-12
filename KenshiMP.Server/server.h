@@ -14,6 +14,13 @@
 
 namespace kmp {
 
+// Token bucket for per-peer flood protection. `tokens` is consumed by gated
+// actions (chat, build) and refilled at a fixed rate up to a small cap.
+struct TokenBucket {
+    double tokens     = 0.0;
+    double lastRefill = 0.0;
+};
+
 struct ConnectedPlayer {
     PlayerID    id;
     std::string name;
@@ -24,7 +31,19 @@ struct ConnectedPlayer {
     float       lastUpdate;
     std::vector<EntityID> ownedEntities;
     bool        lobbyReady = false;
+
+    // Per-player rate limit buckets (see HandleChatMessage / HandleBuildRequest).
+    TokenBucket chatBucket{};
+    TokenBucket buildBucket{};
 };
+
+// Chat is allowed 4 messages/sec with a burst of 8.
+static constexpr double CHAT_BUCKET_CAP    = 8.0;
+static constexpr double CHAT_REFILL_PER_SEC = 4.0;
+// Build requests: 8/sec with a burst of 16 (drag-placing supports faster
+// taps but still caps the worst-case load on the server).
+static constexpr double BUILD_BUCKET_CAP    = 16.0;
+static constexpr double BUILD_REFILL_PER_SEC = 8.0;
 
 struct ServerEntity {
     // Identity

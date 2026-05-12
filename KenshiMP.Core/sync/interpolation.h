@@ -131,6 +131,12 @@ private:
     mutable std::unordered_map<EntityID, EntityInterpState> m_entities;
     float m_currentTime = 0.f;
     float m_deltaTime   = 0.f;
+    float m_pruneAccumulator = 0.f;
+
+    // Drop interpolation buffers that haven't received an update in this many
+    // seconds. Bounded just above the worst-case interest-set churn so we don't
+    // delete state for a temporarily-occluded entity that's about to reappear.
+    static constexpr float KMP_INTERP_STALE_SEC = 30.f;
 };
 
 } // namespace kmp

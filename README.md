@@ -4,6 +4,14 @@
 
 Kenshi-Online adds seamless multiplayer to Kenshi using native MyGUI integration, ENet networking, and Ogre plugin injection. Players can explore, fight, build, and trade together in the open world of Kenshi.
 
+## Community & Support
+
+- **Discord:** https://discord.gg/JJcJZxE4ma — live chat, bug reports, server browser
+- **Discussions:** https://github.com/WokiDev/Kenshi-Online/discussions — Q&A, feedback, ideas
+- **Issues:** https://github.com/WokiDev/Kenshi-Online/issues — confirmed bug reports
+
+If the Discord invite link is expired, please open a GitHub Discussion and we'll post a fresh one.
+
 ## Features
 
 - **Up to 16 players** on a single server
