@@ -503,6 +503,22 @@ void SyncOrchestrator::StagePollAndSendPositions() {
     auto localEntities = m_registry.GetPlayerEntities(m_localPlayerId);
     if (localEntities.empty()) return;
 
+    // Batch all dirty positions into a single C2S_PositionUpdate packet rather
+    // than one packet per entity. Previously each squad member produced its
+    // own ENet packet every tick — at 16 owned characters × 20Hz that's 320
+    // packets/sec of UDP overhead per client, blowing through router NAT
+    // tables and ENet's outbound buffer on slower connections.
+    struct PendingPos {
+        EntityID netId;
+        Vec3     pos;
+        Quat     rot;
+        uint8_t  animState;
+        uint8_t  moveSpeed;
+        uint16_t flags;
+    };
+    std::vector<PendingPos> batch;
+    batch.reserve(std::min<size_t>(localEntities.size(), 255));
+
     for (EntityID netId : localEntities) {
         auto infoCopy = m_registry.GetInfo(netId);
         if (!infoCopy) continue;
@@ -510,10 +526,6 @@ void SyncOrchestrator::StagePollAndSendPositions() {
         void* gameObj = m_registry.GetGameObject(netId);
         if (!gameObj) continue;
 
-        // Read position, rotation, moveSpeed, and animState from the character.
-        // SEH_ReadCharacterBG reads all fields via CharacterAccessor (returns 0
-        // for moveSpeed/animState when offsets are -1, which is fine — we fall
-        // back to derived values below).
         BGReadResult rd = SEH_ReadCharacterBG(gameObj);
         if (!rd.valid) {
             m_registry.SetGameObject(netId, nullptr);
@@ -528,40 +540,47 @@ void SyncOrchestrator::StagePollAndSendPositions() {
         float dist = pos.DistanceTo(infoCopy->lastPosition);
         float computedSpeed = (elapsedSec > 0.001f) ? dist / elapsedSec : 0.f;
 
-        // Prefer game-read moveSpeed; fall back to computed speed from position delta
         float moveSpeed = rd.speed;
         if (moveSpeed <= 0.f && computedSpeed > 0.f) {
             moveSpeed = computedSpeed;
         }
 
-        uint32_t compQuat = rotation.Compress();
-
-        // Prefer game-read animState; fall back to speed-derived heuristic
         uint8_t animState = rd.animState;
         if (animState == 0 && moveSpeed > 0.5f) {
             animState = (moveSpeed > 5.0f) ? 2 : 1;
         }
 
-        uint8_t moveSpeedU8 = static_cast<uint8_t>(
-            std::min(255.f, moveSpeed / 15.f * 255.f));
-        uint16_t flags = (moveSpeed > 3.0f) ? 0x01 : 0x00;
+        PendingPos pp;
+        pp.netId = netId;
+        pp.pos = pos;
+        pp.rot = rotation;
+        pp.animState = animState;
+        pp.moveSpeed = static_cast<uint8_t>(std::min(255.f, moveSpeed / 15.f * 255.f));
+        pp.flags = (moveSpeed > 3.0f) ? 0x01 : 0x00;
+        batch.push_back(pp);
 
+        if (batch.size() >= 255) break; // wire format caps count at U8
+    }
+
+    if (!batch.empty()) {
         PacketWriter writer;
         writer.WriteHeader(MessageType::C2S_PositionUpdate);
-        writer.WriteU8(1);
-        writer.WriteU32(netId);
-        writer.WriteF32(pos.x);
-        writer.WriteF32(pos.y);
-        writer.WriteF32(pos.z);
-        writer.WriteU32(compQuat);
-        writer.WriteU8(animState);
-        writer.WriteU8(moveSpeedU8);
-        writer.WriteU16(flags);
-
+        writer.WriteU8(static_cast<uint8_t>(batch.size()));
+        for (const auto& pp : batch) {
+            CharacterPosition cp{};
+            cp.entityId       = pp.netId;
+            cp.posX           = pp.pos.x;
+            cp.posY           = pp.pos.y;
+            cp.posZ           = pp.pos.z;
+            cp.compressedQuat = pp.rot.Compress();
+            cp.animStateId    = pp.animState;
+            cp.moveSpeed      = pp.moveSpeed;
+            cp.flags          = pp.flags;
+            writer.WriteRaw(&cp, sizeof(cp));
+            m_registry.UpdatePosition(pp.netId, pp.pos);
+            m_registry.UpdateRotation(pp.netId, pp.rot);
+        }
         m_client.SendUnreliable(writer.Data(), writer.Size());
-
-        m_registry.UpdatePosition(netId, pos);
-        m_registry.UpdateRotation(netId, rotation);
     }
 
     // NOTE: Background thread also builds a cached packet in packetBytes via
@@ -915,6 +934,20 @@ void SyncOrchestrator::BackgroundReadEntities() {
     }
 
     if (!pendingPositions.empty()) {
+        // The count is wire-encoded as U8, so we can never send more than 255
+        // entities in a single batch — anything past that gets dropped without
+        // logging by the previous code, which silently corrupted state for
+        // players with very large squads. Clamp and warn instead.
+        constexpr size_t MAX_BATCH = 255;
+        if (pendingPositions.size() > MAX_BATCH) {
+            static thread_local int s_warnCount = 0;
+            if (++s_warnCount <= 5) {
+                spdlog::warn("SyncOrch::BackgroundReadEntities: clamping pending positions "
+                             "from {} to {} (U8 wire cap)", pendingPositions.size(), MAX_BATCH);
+            }
+            pendingPositions.resize(MAX_BATCH);
+        }
+
         PacketWriter writer;
         writer.WriteHeader(MessageType::C2S_PositionUpdate);
         writer.WriteU8(static_cast<uint8_t>(pendingPositions.size()));

@@ -190,6 +190,26 @@ void Interpolation::Update(float deltaTime) {
     // Note: snap correction timers are ticked inside SnapCorrection::Apply()
     // which is called from GetInterpolated(). No need to tick here — doing
     // both would double-decrement the timer.
+
+    // Drop interpolation state for entities that have been silent for over
+    // KMP_INTERP_STALE_SEC (default 30 s). Without this, m_entities grows
+    // unbounded if a remote despawn message is lost or an entity is
+    // permanently removed from the world — leaking a snapshot buffer per
+    // dead entity until the next Clear(). Pruning happens at most once per
+    // second to keep the lock cost bounded.
+    m_pruneAccumulator += deltaTime;
+    if (m_pruneAccumulator < 1.0f) return;
+    m_pruneAccumulator = 0.f;
+
+    const float staleCutoff = m_currentTime - KMP_INTERP_STALE_SEC;
+    for (auto it = m_entities.begin(); it != m_entities.end(); ) {
+        const Snapshot* newest = it->second.Get(0);
+        if (newest && newest->timestamp < staleCutoff) {
+            it = m_entities.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 } // namespace kmp

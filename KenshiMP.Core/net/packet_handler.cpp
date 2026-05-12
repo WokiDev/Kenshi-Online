@@ -643,6 +643,21 @@ private:
                 continue;
             }
 
+            // Reject world-positions outside Kenshi's actual map bounds. The
+            // playable area is roughly ±400 km; anything past 1 million units
+            // is either a buggy server, a modified client, or junk data —
+            // accepting it would teleport the remote character into the void
+            // and corrupt the snap-correction state for several frames.
+            constexpr float MAX_WORLD_COORD = 1.0e6f;
+            if (std::abs(pos.posX) > MAX_WORLD_COORD ||
+                std::abs(pos.posY) > MAX_WORLD_COORD ||
+                std::abs(pos.posZ) > MAX_WORLD_COORD) {
+                spdlog::warn("PacketHandler: Skipping entity {} — position outside world bounds "
+                             "({:.0f},{:.0f},{:.0f})",
+                             pos.entityId, pos.posX, pos.posY, pos.posZ);
+                continue;
+            }
+
             Vec3 position(pos.posX, pos.posY, pos.posZ);
             Quat rotation = Quat::Decompress(pos.compressedQuat);
 
